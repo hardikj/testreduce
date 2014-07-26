@@ -363,7 +363,7 @@ var GET_crashers = function( req, res ) {
 var GET_failsDistr = function( req, res ) {
     res.write('<html><body>\n');
     res.write('<h1>Distribution of semantic errors</h1>');
-    backend.getFailsDistr(null, function(err, result) {
+    backend.getFailsDistr(function(err, result) {
         res.write( '<table><tr style="font-weight:bold"><td style="padding-left:20px;">' + '# errors' );
         res.write( '</td><td style="padding-left:20px;">' + '#pages' + '</td></tr>' );
         // console.log(result.fails);

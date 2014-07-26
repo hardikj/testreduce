@@ -53,7 +53,7 @@ function CassandraBackend(name, config, callback) {
     self.testScores = [];
     self.topFailsArray = [];
     self.testByScoreToCommit = [];
-    self.latestResults = [];
+    self.latestResults = {};
 
     self.tasks =[getCommits.bind(this), initLatestResults.bind(this), getTests.bind(this), initTestPQ.bind(this), initTopFails.bind(this)];
     // Load all the tests from Cassandra - do this when we see a new commit hash
@@ -117,7 +117,7 @@ function initLatestResults(cb) {
     }
 
     var lastCommit = this.commits[0] && this.commits[0].hash.toString();
-    var skips = {}, cql;
+    var skips = {}, cql, fails = {};
 
     if (this.commits.length === 1) {
         var queryCB = function (err, results) {
@@ -135,8 +135,15 @@ function initLatestResults(cb) {
                     } else {
                         skips[counts.skips] += 1;
                     }
+                    if (!fails[counts.fails]) {
+                        fails[counts.fails] = 1;
+                    } else {
+                        fails[counts.fails]++;
+                    }
                 });
-                this.latestResults[lastCommit] = skips;
+                this.latestResults[lastCommit] = {};
+                this.latestResults[lastCommit].skips = skips;
+                this.latestResults[lastCommit].fails = fails;
             }
         };
         // since only one commit in db, skips/fails stats can be computed with current commit
@@ -144,7 +151,7 @@ function initLatestResults(cb) {
         this.client.execute(cql, [lastCommit], this.consistencies.write, queryCB.bind(this));
     } else {
         // fill this by latest results
-        cql = 'select skipstats from revision_summary where revision = ?';
+        cql = 'select skipstats, failstats from revision_summary where revision = ?';
         var queryCB2 = function (err, results) {
             if (err) {
                 console.log("err: " + err);
@@ -160,8 +167,14 @@ function initLatestResults(cb) {
                     } else {
                         skips[counts.skips] += 1;
                     }
+                    if (!fails[counts.fails]) {
+                        fails[counts.fails] = 1;
+                    } else {
+                        fails[counts.fails]++;
+                    }
                 });
-            this.latestResults[lastCommit] = skips;
+            this.latestResults[lastCommit].skips = skips;
+            this.latestResults[lastCommit].fails = fails;
             }
         };
         var queryCB1 =  function (err, results) {
@@ -173,7 +186,8 @@ function initLatestResults(cb) {
                 var secondLastCommit = this.commits[1].hash.toString();
                 this.client.execute(cql, [secondLastCommit], this.consistencies.write, queryCB2.bind(this));
             } else {
-                this.latestResults[lastCommit] = results.rows[0].skipstats;
+                this.latestResults[lastCommit].skips = results.rows[0].skipstats;
+                this.latestResults[lastCommit].fails = results.rows[0].failstats;
             }
         };
         this.client.execute(cql, [lastCommit], this.consistencies.write, queryCB1.bind(this));
@@ -435,17 +449,26 @@ CassandraBackend.prototype.updateCommits = function (lastCommitTimestamp, commit
         self = this;
 
         if (this.latestResults[commit]) {
-            skips = {value: this.latestResults[commit], hint: 'map'};
+            this.latestResults[commit] = {};
+            skips = {value: this.latestResults[commit].skips, hint: 'map'};
+            fails = {value: this.latestResults[commit].fails, hint: 'map'};
         } else if(this.commits.length >1){
-            this.latestResults[commit] = this.latestResults[this.commits[1].hash];
-            skips = {value: this.latestResults[this.commits[1].hash], hint: 'map'};
+            this.latestResults[commit] = {};
+            this.latestResults[commit].skips = this.latestResults[this.commits[1].hash].skips;
+            this.latestResults[commit].fails = this.latestResults[this.commits[1].hash].fails;
+            skips = {value: this.latestResults[this.commits[1].hash].skips, hint: 'map'};
+            fails = {value: this.latestResults[this.commits[1].hash].fails, hint: 'map'};
         } else {
+            this.latestResults[commit] = {};
             skips = {value: {}, hint: 'map'};
+            fails = {value: {}, hint: 'map'};
+            this.latestResults[commit].skips = {};
+            this.latestResults[commit].fails = {};
         }
 
         this.getStatistics(function (err, result) {
-            cql = 'insert into revision_summary (revision, errors, skips, fails, numtests, skipstats) values (?, ? , ? , ?, ?, ?);';
-            args = [new Buffer(commit), result.averages.errors, result.averages.skips, result.averages.fails, result.averages.numtests, skips];
+            cql = 'insert into revision_summary (revision, errors, skips, fails, numtests, skipstats, failstats) values (?, ? , ? , ?, ?, ?, ?);';
+            args = [new Buffer(commit), result.averages.errors, result.averages.skips, result.averages.fails, result.averages.numtests, skips, fails];
             self.client.execute(cql, args, self.consistencies.write, function(err, result) {
                 if (err) {
                     console.log(err);
@@ -781,23 +804,30 @@ CassandraBackend.prototype.addResult = function (test, commit, result, cb) {
         skips, counts;
 
     var score = statsScore(skipCount, failCount, errorCount);
-    cql = 'UPDATE revision_summary SET skipstats = ? WHERE revision = ?';
+    cql = 'UPDATE revision_summary SET skipstats = ?, failstats = ? WHERE revision = ?';
 
     //Update latest results array
     if (this.commits.length > 1 && this.testScores[test.toString()] != score ) {
         counts = countScore(score);
-        skips = this.latestResults[commit.toString()];
+        skips = this.latestResults[commit.toString()].skips;
+        fails = this.latestResults[commit.toString()].fails;
 
         if (!skips[counts.skips]) {
             skips[counts.skips] = 1;
         } else {
             skips[counts.skips] += 1;
         }
-
-        this.latestResults[commit.toString()] = skips;
+        if (!fails[counts.fails]) {
+            fails[counts.fails] = 1;
+        } else {
+            fails[counts.fails]++;
+        }
+        this.latestResults[commit.toString()].skips = skips;
+        this.latestResults[commit.toString()].fails = fails;
 
         args = {value: skips, hint: 'map'};
-        this.client.execute(cql, [args, commit], this.consistencies.write, function (err, result) {
+        args2 = {value: fails, hint: 'map'};
+        this.client.execute(cql, [args, args2, commit], this.consistencies.write, function (err, result) {
             if (err) {
                 console.log(err);
             }
@@ -806,22 +836,33 @@ CassandraBackend.prototype.addResult = function (test, commit, result, cb) {
     } else {
 
         counts = countScore(score);
-        skips = this.latestResults[commit.toString()];
+        skips = this.latestResults[commit.toString()].skips;
+        fails = this.latestResults[commit.toString()].fails;
 
         // update stats
         if (!skips) {
             skips = [];
+        }
+        if (!fails) {
+            fails = [];
         }
         if (!skips[counts.skips]) {
             skips[counts.skips] = 1;
         } else {
             skips[counts.skips] += 1;
         }
-        this.latestResults[commit.toString()] = skips;
+        if (!fails[counts.fails]) {
+            fails[counts.fails] = 1;
+        } else {
+            fails[counts.fails]++;
+        }
+        this.latestResults[commit.toString()].skips = skips;
+        this.latestResults[commit.toString()].fails = fails;
 
         // update db with stats
         args =  {value: skips, hint: 'map'};
-        this.client.execute(cql, [args, commit] , this.consistencies.write, function (err, result) {
+        args2 =  {value: fails, hint: 'map'};
+        this.client.execute(cql, [args, args2, commit] , this.consistencies.write, function (err, result) {
             if (err) {
                 console.log(err);
             }
@@ -919,38 +960,19 @@ CassandraBackend.prototype.getTopFails = function (offset, limit, cb) {
     cb(results);
 };
 
-CassandraBackend.prototype.getFailsDistr = function(commit, cb) {
-	var commit = this.commits.length
-		&& this.commits[this.commits.length - 1]
-		|| null;
-    var args = [],
-    results = {};
+CassandraBackend.prototype.getFailsDistr = function(cb) {
 
-    var cql = "select score from test_by_score where commit = ?";
-    args = args.concat([commit]);
-    this.client.execute(cql, args, this.consistencies.write, function(err, results) {
-        if (err) {
-            console.log("err: " + err);
-            cb(err);
-        } else if (!results || !results.rows) {
-            console.log( 'no seen commits, error in database' );
-            cb(null);
-        } else {
-            //console.log("hooray we have data!: " + JSON.stringify(results, null,'\t'));
-            var fails = {};
-            results.rows.forEach(function(item) {
-                var data = item[0];
-                var counts = countScore(data);
-                if (!fails[counts.fails]) {
-                    fails[counts.fails] = 1;
-                } else {
-                    fails[counts.fails]++;
-                }
-            });
-            results = {fails: fails};
-            cb(null, results);
-        }
-    });
+    var args = [], results = {}, fails;
+
+    if (!this.commits.length) {
+        cb(null, { fails: {}});
+    } else {
+        commit = this.commits[0].hash.toString();
+        fails = this.latestResults[commit].fails;
+        results = { fails: fails };
+    }
+    cb(null, results);
+
 };
 
 CassandraBackend.prototype.getSkipsDistr = function(cb) {
@@ -959,7 +981,7 @@ CassandraBackend.prototype.getSkipsDistr = function(cb) {
         cb(null, { skips: {}});
     } else {
         commit = this.commits[0].hash.toString();
-        skips = this.latestResults[commit];
+        skips = this.latestResults[commit].skips;
         results = { skips: skips };
     }
     cb(null, results);
